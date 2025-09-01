@@ -1,0 +1,24 @@
+# 编译生成文件
+*.out
+*.o
+*.dylib
+*.a
+
+# 构建目录
+build/
+bin/
+.DS_Store
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# 其他
+*.log
+
+# 数据库
+database/
+*.db
+
+#模型
+models/
