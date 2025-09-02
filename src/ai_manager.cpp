@@ -26,6 +26,27 @@ AIManager::~AIManager(){
 
 }
 
+void AIManager::get_input_output_name(const Ort::Session & session){
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+    size_t num_inputs = session.GetInputCount();
+    std::cout << "Number of model inputs: " << num_inputs << std::endl;
+
+    Ort::Allocator allocator(session, memory_info);
+    for(size_t i = 0; i < num_inputs; ++i){
+        Ort::AllocatedStringPtr input_name = session.GetInputNameAllocated(i, allocator);
+        std::cout << "Input Name " << i << ": " << input_name << std::endl;
+    }
+
+    size_t num_outputs = session.GetOutputCount();
+    std::cout << "Number of model outputs: " << num_outputs << std::endl;
+
+    for(size_t i = 0; i < num_outputs; ++i){
+        Ort::AllocatedStringPtr output_name = session.GetOutputNameAllocated(i, allocator);
+        std::cout << "Output Name " << i << ": " << output_name << std::endl;
+    }
+
+}
 
 void AIManager::load_audio_model(const std::string & encoder_path, const std::string & decoder_path){
     if(a_audio_model_loaded){
@@ -39,7 +60,9 @@ void AIManager::load_audio_model(const std::string & encoder_path, const std::st
 
         a_encoder_session = Ort::Session(a_env, encoder_path.c_str(), seesion_options);
         a_decoder_session = Ort::Session(a_env, decoder_path.c_str(), seesion_options);
-
+        
+        get_input_output_name(a_encoder_session);
+        get_input_output_name(a_decoder_session);
 
         a_audio_model_loaded = true;
         std::cout << "Audio models loaded successfully." << std::endl;
@@ -50,6 +73,64 @@ void AIManager::load_audio_model(const std::string & encoder_path, const std::st
         a_audio_model_loaded = false;
     }
     
+}
+
+std::string AIManager::decode_and_transcribe(const Ort::Value & encoder_output){
+    Ort::SessionOptions session_options;
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+    std::vector<const char*> decoder_input_names = {"input_ids","encoder_hidden_states"};
+    std::vector<const char*> decoder_output_names = {"logits"};
+
+    //the token is general, so what's the main token?
+    std::vector<int64_t> input_ids {50257};
+
+    std::vector<int64_t> output_tokens;
+    const int64_t EOT_TOKEN = 50256;
+    const int MAX_LENGTH = 200;
+
+    for(int i = 0; i < MAX_LENGTH; ++i){
+        //create input tensor
+        std::array<int64_t, 2> input_shape = {1, static_cast<long long>(input_ids.size())};
+        Ort::Value input_ids_tensor = Ort::Value::CreateTensor<int64_t>(
+            memory_info,
+            input_ids.data(),
+            input_ids.size(),
+            input_shape.data(),
+            input_shape.size()
+        );
+
+        std::vector<Ort::Value> decoder_inputs;
+        decoder_inputs.push_back(std::move(input_ids_tensor));
+        decoder_inputs.push_back(std::move(const_cast<Ort::Value&>(encoder_output)));
+
+        auto decoder_outputs = a_decoder_session.Run(
+            Ort::RunOptions{nullptr},
+            decoder_input_names.data(),
+            decoder_inputs.data(),
+            1,
+            decoder_output_names.data(),
+            1
+        );
+
+        //get the highest token
+        float * logits = decoder_outputs[0].GetTensorMutableData<float>();
+
+        auto logits_shape = decoder_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+        int64_t vocab_size = logits_shape[2];
+        float * last_logits = logits + (logits_shape[1] - 1) * vocab_size;
+
+        int64_t next_token_index = std::distance(last_logits, std::max_element(last_logits, last_logits + vocab_size));
+
+        if(next_token_index == EOT_TOKEN){
+            break;
+        }
+
+        input_ids.push_back(next_token_index);
+
+    }
+
+    return "Final transcribed text : Placeholder";
 }
 
 std::string AIManager::transcribe_audio(const std::string & audio_file_path){
@@ -75,23 +156,108 @@ std::string AIManager::transcribe_audio(const std::string & audio_file_path){
         return "Error: Could not find stream information.\n";
     }
 
-    int audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1,&codec_ctx,0);
+    int audio_stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
     if(audio_stream_idx < 0){
         return "Error: Could not find audio stream.\n";
     }
 
     //open the decoder
-    
+    codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[audio_stream_idx]->codecpar);
+    if(avcodec_open2(codec_ctx, codec, nullptr) < 0){
+        return "Error: Could not open codec.\n";
+    }
 
+    std::vector<float> pcm_data;
+    while(av_read_frame(fmt_ctx, pkt) >= 0){
+        if(pkt->stream_index == audio_stream_idx){
+            if(avcodec_send_packet(codec_ctx, pkt) >= 0){
+                while(avcodec_receive_frame(codec_ctx, frame) >= 0){
+                    //simple deal
+                    for(int i = 0; i < frame->nb_samples; ++i){
+                        pcm_data.push_back(static_cast<float>(reinterpret_cast<int16_t*>(frame->data[0])[i]) / 32768.0f);
+                    }
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
     //2.convert PCM to Mel Spectrogram
+    const int n_fft = 400; //windwos size
+    const int hop_length = 160; //frame offset
+    const int n_mels = 80; //mel channels
+    const int sample_rate = 16000;
     //3.convert Mel to tensor
     //4.get the encoder's output
     //5.cal
+
     //6.decode round by round, and get a token
+    // std::vector<float> mel_spectrogram_data;
+    std::vector<std::vector<float>> mel_spectrogram_data;
+
+    if(pcm_data.size() < n_fft){
+        return "Error: PCM data is too short for Mel Spectrogram.\n";
+    }
+
+    int num_frame = (pcm_data.size() - n_fft) / hop_length + 1;
+    mel_spectrogram_data.resize(num_frame, std::vector<float>(n_mels, 0.0f));
+
+    for(int i = 0; i < num_frame; ++i){
+        int start_pos = i * hop_length;
+        std::vector<float> frame_data(pcm_data.begin() + start_pos, pcm_data.begin() + start_pos + n_fft);
+
+        //simple deal
+
+        for(int j = 0; j < n_mels; ++j){
+            mel_spectrogram_data[i][j] = std::log(std::abs(frame_data[j] * 10.0f) + 1e-6);
+        }
+    }
+
+    std::vector<float> encoder_input_values;
+    encoder_input_values.reserve(num_frame * n_mels);
+    for(const auto & row : mel_spectrogram_data){
+        encoder_input_values.insert(encoder_input_values.end(), row.begin(), row.end());
+    }
+
+
+
+    std::array<int64_t, 3> encoder_input_shape {1, n_mels, static_cast<long long>(num_frame)};
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,OrtMemType::OrtMemTypeDefault);
+
+
+    Ort::Value encoder_input_tensor = Ort::Value::CreateTensor<float>(
+        memory_info,
+        encoder_input_values.data(),
+        encoder_input_values.size(),
+        encoder_input_shape.data(),
+        encoder_input_shape.size()
+    );
+
+    std::vector<const char*> encoder_input_names = {"input_features"};
+    std::vector<const char*> encoder_output_names = {"last_hidden_state"};
+
+    auto encoder_outputs = a_encoder_session.Run(
+        Ort::RunOptions{nullptr},
+        encoder_input_names.data(),
+        &encoder_input_tensor,
+        1,
+        encoder_input_names.data(),
+        1 
+    );
+    
+
     //7.change the token to str
+    std::string transcription = decode_and_transcribe(encoder_outputs[0]);
 
 
-    return "This is a placeholder for the transcribed text.\n";
+    //free sources
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    avcodec_free_context(&codec_ctx);
+    avformat_close_input(&fmt_ctx);
+
+
+    return transcription;
 }
 
 void AIManager::load_labels(const std::string & label_path){
@@ -143,7 +309,7 @@ void AIManager::load_image_model(const std::string & model_path){
 
         for (size_t i = 0; i < num_outputs; ++i) {
             Ort::AllocatedStringPtr output_name = a_session.GetOutputNameAllocated(i, allocator);
-            std::cout << "Output Name " << i << ": " << output_name.get() << std::endl;
+            std::cout << "Output Name " << i << ": " << output_name << std::endl;
         }
 
     } catch (const Ort::Exception& e) {

@@ -29,6 +29,7 @@ namespace AIvoice{
         //load the ai model
         //wait a min, reload when somebody refresh the website every time?
         s_ai_manager.load_image_model("../models/mobilenetv2-7.onnx");
+        s_ai_manager.load_audio_model("../models/whisper_base/encoder_model.onnx","../models/whisper_base/decoder_model.onnx");
         do_accept();
         std::cout << "Server listening on " << s_ipaddr << ":" << s_port << std::endl;
         s_ioc.run();

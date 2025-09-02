@@ -23,6 +23,8 @@ class AIManager{
     private:
 
         void load_labels(const std::string & label_path);
+        void get_input_output_name(const Ort::Session & session);
+        std::string decode_and_transcribe(const Ort::Value & encoder_output);
 
         Ort::Env a_env;
         Ort::Session a_session;
