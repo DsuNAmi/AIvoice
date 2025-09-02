@@ -28,7 +28,7 @@ namespace AIvoice{
     void Server::run(){
         //load the ai model
         //wait a min, reload when somebody refresh the website every time?
-        s_ai_manager.load_model("../models/");
+        s_ai_manager.load_image_model("../models/mobilenetv2-7.onnx");
         do_accept();
         std::cout << "Server listening on " << s_ipaddr << ":" << s_port << std::endl;
         s_ioc.run();
@@ -77,7 +77,7 @@ namespace AIvoice{
                 std::string filepath = "../uploaded_files/" + filename;
 
 
-                std::cout << filepath << std::endl;
+                // std::cout << filepath << std::endl;
 
                 std::ofstream outfile(filepath, std::ios::binary);
                 if(!outfile.is_open()){
@@ -88,7 +88,7 @@ namespace AIvoice{
 
 
                 //use the ai
-                std::string inference_result = s_ai_manager.run_inference(filepath);
+                std::string inference_result = s_ai_manager.run_image_inference(filepath);
 
                 response_status = boost::beast::http::status::ok;
                 nlohmann::json res_json;
@@ -105,6 +105,41 @@ namespace AIvoice{
                 nlohmann::json res_json;
                 res_json["status"] = "error";
                 res_json["message"] = "Server error during upload.";
+                response_body = res_json.dump();
+            }
+        }else if(req.method() == boost::beast::http::verb::post && req.target() == "/transcribe"){
+            try
+            {
+                const std::string & body_content = req.body();
+                auto now = std::chrono::system_clock::now();
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+                std::string filename = "audio_" + std::to_string(now_ms.count()) + ".wav";
+                std::string filepath = "../uploaded_files/" + filename;
+
+                std::ofstream outfile(filepath, std::ios::binary);
+                if(!outfile.is_open()){
+                    throw std::runtime_error("Could not open file for writing.\n");
+                }
+                outfile.write(body_content.c_str(), body_content.length());
+                outfile.close();
+
+                std::string transcription_result = s_ai_manager.transcribe_audio(filepath);
+
+                response_status = boost::beast::http::status::ok;
+                nlohmann::json res_json;
+                res_json["status"] = "ok";
+                res_json["message"] = "Audio uploaded and processing started.";
+                res_json["filename"] = filename;
+                res_json["transcription_result"] = transcription_result;
+                response_body = res_json.dump();
+            }
+            catch(const std::exception& e)
+            {
+                std::cerr << "Error during file transcribed: " << e.what() << std::endl;
+                response_status = boost::beast::http::status::internal_server_error;
+                nlohmann::json res_json;
+                res_json["status"] = "error";
+                res_json["message"] = "Server error during transcribed.";
                 response_body = res_json.dump();
             }
         }else{

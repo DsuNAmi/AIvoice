@@ -22,3 +22,9 @@ database/
 
 #模型
 models/
+
+#uploaded file
+uploaded_files/
+
+#labels
+labels/

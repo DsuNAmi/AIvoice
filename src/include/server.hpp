@@ -8,8 +8,11 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <chrono>
+#include <numeric>
+#include <vector>
+#include <algorithm>
 
-#include "include/ai_manager.hpp"
+#include "ai_manager.hpp"
 
 
 namespace AIvoice{
