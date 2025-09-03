@@ -28,3 +28,11 @@ uploaded_files/
 
 #labels
 labels/
+
+#image and audio
+*.jpeg
+*.jpg
+*.png
+
+*.m4a
+*.wav

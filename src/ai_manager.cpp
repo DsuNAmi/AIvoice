@@ -8,6 +8,7 @@
 extern "C" {
     #include <libavcodec/avcodec.h>
     #include <libavformat/avformat.h>
+    #include <libavutil/avutil.h>
 }
 
 #include "include/ai_manager.hpp"
@@ -16,13 +17,33 @@ AIManager::AIManager()
 : a_env(ORT_LOGGING_LEVEL_WARNING, "AIvoice"),
   a_session(nullptr), a_encoder_session(nullptr), a_decoder_session(nullptr),
   a_image_model_loaded(false), a_audio_model_loaded(false),
-  a_sample_rate(16000), a_channles(1)
+  a_sample_rate(16000), a_channles(1), a_n_fft(400), a_hop_length(160), a_n_mel(80)
 {
     load_labels("../labels/imagenet_classes.txt");
+    load_whisper_vocab("../labels/whisper_vocab.json");
     av_log_set_level(AV_LOG_QUIET);
 }
 
 AIManager::~AIManager(){
+
+}
+
+void AIManager::load_whisper_vocab(const std::string & vocab_path){
+    std::ifstream infile(vocab_path);
+    if(!infile.is_open()){
+        std::cerr << "Error: Could not open Whisper vocab file: " << vocab_path << std::endl;
+        return;
+    }
+
+    nlohmann::json vocab_json;
+    infile >> vocab_json;
+
+    const auto & vocab_map = vocab_json["model"]["vocab"];
+    for(const auto & item : vocab_map.items()){
+        a_whisper_vocab[item.value().get<int64_t>()] = item.key();
+    }
+
+    std::cout << "Loaded" << a_whisper_vocab.size() << " Whisper tokens." << std::endl;
 
 }
 
@@ -75,6 +96,72 @@ void AIManager::load_audio_model(const std::string & encoder_path, const std::st
     
 }
 
+void AIManager::computeFFT(const std::vector<float> & input, std::vector<float> & output_magnitude){
+    int N = input.size();
+    if(N == 0) return;
+
+    std::vector<std::complex<float>> C(N);
+    for(int i = 0; i < N; ++i){
+        C[i] = std::complex<float>(input[i], 0.0f);
+    }
+
+    std::vector<std::complex<float>> X(N);
+    for(int k = 0; k < N / 2; ++k){
+        std::complex<float> sum(0.0f, 0.0f);
+        for(int n = 0; n < N; ++n){
+            float angle = -2.0f * M_PI * k * n / N;
+            sum += C[n] * std::complex<float>(std::cos(angle), std::sin(angle));
+        }
+        X[k] = sum;
+    }
+
+    output_magnitude.resize(N / 2 + 1);
+    for(int i = 0; i < N / 2 + 1; ++i){
+        output_magnitude[i] = std::abs(X[i]);
+    }
+}
+
+std::vector<std::vector<float>> AIManager::create_mel_filter_bank(){
+    std::vector<std::vector<float>> filters(a_n_mel, std::vector<float>(a_n_fft / 2 + 1, 0.0f));
+    
+    auto hz_to_mel = [](float hz){return 2595.0f * std::log10(1.0f + hz / 700.0f);};
+    auto mel_to_hz = [](float mel){return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);};
+
+    float mel_min = hz_to_mel(0.0f);
+    float mel_max = hz_to_mel(a_sample_rate / 2.0f);
+
+    std::vector<float> mel_points(a_n_mel + 2);
+    for(int i = 0; i < a_n_mel + 2; ++i){
+        mel_points[i] = mel_min + (mel_max - mel_min) / (a_n_mel + 1) * i;
+    }
+
+    std::vector<float> hz_points(a_n_mel + 2);
+    for(int i = 0; i < a_n_mel + 2; ++i){
+        hz_points[i] = mel_to_hz(mel_points[i]);
+    }
+
+    std::vector<int> bin_points(a_n_mel + 2);
+    for(int i = 0; i < a_n_mel + 2; ++i){
+        bin_points[i] = static_cast<int>(std::floor((a_n_fft / 2 + 1) * hz_points[i] / (a_sample_rate / 2.0f)));
+    }
+
+    for(int i = 0; i < a_n_mel; ++i){
+        int left = bin_points[i];
+        int center = bin_points[i + 1];
+        int right = bin_points[i + 2];
+
+        for(int j = left; j < center; ++j){
+            filters[i][j] = static_cast<float>(j - left) / static_cast<float>(center - left);
+        }
+        
+        for(int j = center; j < right; ++j){
+            filters[i][j] = static_cast<float>(right - j) / static_cast<float>(right - center);
+        }
+    }
+
+    return filters;
+}
+
 std::string AIManager::decode_and_transcribe(const Ort::Value & encoder_output){
     Ort::SessionOptions session_options;
     Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
@@ -108,7 +195,7 @@ std::string AIManager::decode_and_transcribe(const Ort::Value & encoder_output){
             Ort::RunOptions{nullptr},
             decoder_input_names.data(),
             decoder_inputs.data(),
-            1,
+            2,
             decoder_output_names.data(),
             1
         );
@@ -122,6 +209,9 @@ std::string AIManager::decode_and_transcribe(const Ort::Value & encoder_output){
 
         int64_t next_token_index = std::distance(last_logits, std::max_element(last_logits, last_logits + vocab_size));
 
+        output_tokens.push_back(next_token_index);
+
+
         if(next_token_index == EOT_TOKEN){
             break;
         }
@@ -130,7 +220,18 @@ std::string AIManager::decode_and_transcribe(const Ort::Value & encoder_output){
 
     }
 
-    return "Final transcribed text : Placeholder";
+    std::string transcribed_text;
+    for(int64_t token_id : output_tokens){
+        auto it = a_whisper_vocab.find(token_id);
+        if(it != a_whisper_vocab.end()){
+            transcribed_text += it->second;
+        }else{
+            transcribed_text += "[UNK]";
+        }
+    }
+
+
+    return transcribed_text;
 }
 
 std::string AIManager::transcribe_audio(const std::string & audio_file_path){
@@ -183,71 +284,85 @@ std::string AIManager::transcribe_audio(const std::string & audio_file_path){
         av_packet_unref(pkt);
     }
     //2.convert PCM to Mel Spectrogram
-    const int n_fft = 400; //windwos size
-    const int hop_length = 160; //frame offset
-    const int n_mels = 80; //mel channels
-    const int sample_rate = 16000;
+    // const int sample_rate = 16000;
     //3.convert Mel to tensor
     //4.get the encoder's output
     //5.cal
 
-    //6.decode round by round, and get a token
-    // std::vector<float> mel_spectrogram_data;
-    std::vector<std::vector<float>> mel_spectrogram_data;
+    std::string full_transcription;
+    const int chunk_sample_count = 240240;
 
-    if(pcm_data.size() < n_fft){
-        return "Error: PCM data is too short for Mel Spectrogram.\n";
-    }
+    for(size_t i = 0; i < pcm_data.size(); i += chunk_sample_count){
 
-    int num_frame = (pcm_data.size() - n_fft) / hop_length + 1;
-    mel_spectrogram_data.resize(num_frame, std::vector<float>(n_mels, 0.0f));
+        std::vector<float> audio_chunk;
+        size_t end_pos = std::min(i + chunk_sample_count, pcm_data.size());
+        audio_chunk.assign(pcm_data.begin() + i, pcm_data.begin() + end_pos);
 
-    for(int i = 0; i < num_frame; ++i){
-        int start_pos = i * hop_length;
-        std::vector<float> frame_data(pcm_data.begin() + start_pos, pcm_data.begin() + start_pos + n_fft);
+        if(audio_chunk.size() < chunk_sample_count){
+            audio_chunk.resize(chunk_sample_count, 0.0f);
+        }
 
-        //simple deal
+        //6.decode round by round, and get a token
+        const int time_steps = (audio_chunk.size() - a_n_fft) / a_hop_length + 1;
+        std::vector<float> mel_spectrogram_data(a_n_mel * time_steps, 0.0f);
+    
+        auto mel_filters = create_mel_filter_bank();
+    
+    
+        std::vector<float> window(a_n_fft);
+        for(int i = 0; i < a_n_fft; ++i){
+            window[i] = 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (a_n_fft - 1)));
+        }
+    
+        for(int i = 0; i < time_steps; ++i){
+            int start_pos = i * a_hop_length;
+            std::vector<float> frame_data(a_n_fft, 0.0f);
+    
+            for(int j = 0; j < a_n_fft; ++j){
+                frame_data[j] = audio_chunk[start_pos + j] * window[j];
+            }
+    
+            std::vector<float> fft_magnitude;
+            computeFFT(frame_data, fft_magnitude);
+            
+            for(int j = 0; j < a_n_mel; ++j){
+                float mel_sum = 0.0f;
+                for(int k = 0; k < fft_magnitude.size(); ++k){
+                    mel_sum += mel_filters[j][k] * fft_magnitude[k];
+                }
+                mel_spectrogram_data[j * time_steps + i] = std::log(mel_sum + 1e-6);
+            }
+        }
+    
+        std::array<int64_t, 3> encoder_input_shape {1, a_n_mel, static_cast<long long>(time_steps)};
+        Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,OrtMemType::OrtMemTypeDefault);
+    
+    
+        Ort::Value encoder_input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info,
+            mel_spectrogram_data.data(),
+            mel_spectrogram_data.size(),
+            encoder_input_shape.data(),
+            encoder_input_shape.size()
+        );
+    
+        std::vector<const char*> encoder_input_names = {"input_features"};
+        std::vector<const char*> encoder_output_names = {"last_hidden_state"};
+    
+        auto encoder_outputs = a_encoder_session.Run(
+            Ort::RunOptions{nullptr},
+            encoder_input_names.data(),
+            &encoder_input_tensor,
+            1,
+            encoder_output_names.data(),
+            1 
+        );
 
-        for(int j = 0; j < n_mels; ++j){
-            mel_spectrogram_data[i][j] = std::log(std::abs(frame_data[j] * 10.0f) + 1e-6);
+
+        if(!encoder_outputs.empty()){
+            full_transcription += decode_and_transcribe(encoder_outputs[0]);
         }
     }
-
-    std::vector<float> encoder_input_values;
-    encoder_input_values.reserve(num_frame * n_mels);
-    for(const auto & row : mel_spectrogram_data){
-        encoder_input_values.insert(encoder_input_values.end(), row.begin(), row.end());
-    }
-
-
-
-    std::array<int64_t, 3> encoder_input_shape {1, n_mels, static_cast<long long>(num_frame)};
-    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator,OrtMemType::OrtMemTypeDefault);
-
-
-    Ort::Value encoder_input_tensor = Ort::Value::CreateTensor<float>(
-        memory_info,
-        encoder_input_values.data(),
-        encoder_input_values.size(),
-        encoder_input_shape.data(),
-        encoder_input_shape.size()
-    );
-
-    std::vector<const char*> encoder_input_names = {"input_features"};
-    std::vector<const char*> encoder_output_names = {"last_hidden_state"};
-
-    auto encoder_outputs = a_encoder_session.Run(
-        Ort::RunOptions{nullptr},
-        encoder_input_names.data(),
-        &encoder_input_tensor,
-        1,
-        encoder_input_names.data(),
-        1 
-    );
-    
-
-    //7.change the token to str
-    std::string transcription = decode_and_transcribe(encoder_outputs[0]);
 
 
     //free sources
@@ -256,8 +371,12 @@ std::string AIManager::transcribe_audio(const std::string & audio_file_path){
     avcodec_free_context(&codec_ctx);
     avformat_close_input(&fmt_ctx);
 
-
-    return transcription;
+    if(full_transcription.empty()){
+        //free sources
+        return "Error: Encoder output is Empty.\n";
+    }
+    //7.change the token to str
+    return full_transcription;
 }
 
 void AIManager::load_labels(const std::string & label_path){
